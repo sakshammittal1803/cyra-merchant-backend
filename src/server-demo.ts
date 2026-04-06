@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { createServer } from 'http';
@@ -15,6 +15,16 @@ import {
 } from './services/firebase';
 
 dotenv.config();
+
+// Extend Express Request type to include user
+interface AuthRequest extends Request {
+  user?: {
+    id: number;
+    email: string;
+    role: string;
+    restaurantName?: string;
+  };
+}
 
 const app = express();
 const server = createServer(app);
@@ -58,7 +68,7 @@ let orderIdCounter = 1;
 let menuIdCounter = 1;
 
 // Auth middleware
-const authenticate = (req: any, res: any, next: any) => {
+const authenticate = (req: AuthRequest, res: Response, next: NextFunction) => {
   const token = req.headers.authorization?.split(' ')[1];
   console.log('🔐 Authentication attempt:', {
     hasToken: !!token,
@@ -82,7 +92,7 @@ const authenticate = (req: any, res: any, next: any) => {
     
     // Get user details including restaurant name
     const user = demoData.users.find(u => u.id === decoded.id);
-    if (user) {
+    if (user && req.user) {
       req.user.restaurantName = user.restaurantName;
       console.log('✅ Authenticated:', user.email);
     } else {
@@ -97,6 +107,108 @@ const authenticate = (req: any, res: any, next: any) => {
 };
 
 // Routes
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { email, name, googleId } = req.body;
+    console.log('🔐 Google OAuth attempt for:', email);
+    
+    // Check if user exists
+    let user = demoData.users.find(u => u.email === email);
+    
+    if (user) {
+      // User exists - login
+      console.log('✅ Existing user found, logging in:', email);
+      const token = jwt.sign(
+        { id: user.id, email: user.email, role: user.role },
+        process.env.JWT_SECRET as string,
+        { expiresIn: '24h' }
+      );
+
+      return res.json({
+        token,
+        user: {
+          id: user.id,
+          email: user.email,
+          role: user.role,
+          name: user.name,
+          restaurantName: user.restaurantName,
+        },
+        isNewUser: false,
+      });
+    } else {
+      // New user - return flag to show signup form
+      console.log('📝 New Google user, needs signup:', email);
+      return res.json({
+        isNewUser: true,
+        email,
+        name,
+        googleId,
+      });
+    }
+  } catch (error) {
+    console.error('❌ Google OAuth error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/auth/google-signup', async (req, res) => {
+  try {
+    const { name, email, role, restaurantName, googleId } = req.body;
+    console.log('📝 Google signup for:', email);
+
+    // Check if user already exists
+    const existingUser = demoData.users.find(u => u.email === email);
+    if (existingUser) {
+      return res.status(400).json({ error: 'User already exists with this email' });
+    }
+
+    // Validate input
+    if (!name || !email || !role || !restaurantName) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+
+    if (!['admin', 'staff'].includes(role)) {
+      return res.status(400).json({ error: 'Invalid role specified' });
+    }
+
+    // Create new user (no password needed for Google OAuth)
+    const newUser = {
+      id: demoData.users.length + 1,
+      email,
+      password_hash: '', // No password for Google OAuth users
+      role,
+      name,
+      restaurantName,
+      googleId,
+    };
+
+    demoData.users.push(newUser);
+
+    // Generate token
+    const token = jwt.sign(
+      { id: newUser.id, email: newUser.email, role: newUser.role },
+      process.env.JWT_SECRET as string,
+      { expiresIn: '24h' }
+    );
+
+    console.log(`✅ New Google user registered: ${name} (${email}) as ${role}`);
+
+    res.status(201).json({
+      token,
+      user: {
+        id: newUser.id,
+        email: newUser.email,
+        role: newUser.role,
+        name: newUser.name,
+        restaurantName: newUser.restaurantName,
+      },
+    });
+  } catch (error) {
+    console.error('Google signup error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -359,7 +471,7 @@ app.get('/api/menu', authenticate, (req, res) => {
   res.json(demoData.menuItems);
 });
 
-app.post('/api/menu', authenticate, (req, res) => {
+app.post('/api/menu', authenticate, (req: AuthRequest, res: Response) => {
   const { name, description, price, category, is_available, phase } = req.body;
   
   console.log('📝 Creating new menu item:', name);
@@ -371,7 +483,7 @@ app.post('/api/menu', authenticate, (req, res) => {
     price: parseFloat(price),
     category,
     phase: phase || 'all', // Default to 'all' if not specified
-    restaurantName: req.user.restaurantName || 'Unknown Restaurant',
+    restaurantName: req.user?.restaurantName || 'Unknown Restaurant',
     image_url: null,
     is_available: is_available !== false,
     created_at: new Date().toISOString(),
@@ -390,7 +502,7 @@ app.post('/api/menu', authenticate, (req, res) => {
   res.status(201).json(newItem);
 });
 
-app.put('/api/menu/:id', authenticate, (req, res) => {
+app.put('/api/menu/:id', authenticate, (req: AuthRequest, res: Response) => {
   const { id } = req.params;
   const { name, description, price, category, is_available, phase } = req.body;
   
@@ -405,7 +517,7 @@ app.put('/api/menu/:id', authenticate, (req, res) => {
     price: parseFloat(price),
     category,
     phase: phase || item.phase || 'all',
-    restaurantName: item.restaurantName || req.user.restaurantName || 'Unknown Restaurant',
+    restaurantName: item.restaurantName || req.user?.restaurantName || 'Unknown Restaurant',
     is_available,
     updated_at: new Date().toISOString(),
   });
@@ -643,7 +755,7 @@ async function startServer() {
     console.log('   Firebase Key:', firebaseOrder.firebaseKey);
     console.log('───────────────────────────────────────');
     
-    const merchantOrder = convertFirebaseOrderToMerchant(firebaseOrder);
+    const merchantOrder: any = convertFirebaseOrderToMerchant(firebaseOrder);
     merchantOrder.id = orderIdCounter++;
     
     demoData.orders.push(merchantOrder);

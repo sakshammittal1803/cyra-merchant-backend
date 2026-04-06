@@ -5,14 +5,28 @@ import jwt from 'jsonwebtoken';
 let io: SocketIOServer;
 
 export const initializeSocket = (server: HTTPServer) => {
+  // Allow both development and production origins
+  const allowedOrigins = [
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'http://localhost:5000',
+  ];
+  
+  // In production, also allow the same origin (combined deployment)
+  if (process.env.NODE_ENV === 'production') {
+    // Allow requests from same origin (combined deployment)
+    allowedOrigins.push('*');
+  }
+  
   io = new SocketIOServer(server, {
     cors: {
-      origin: ['http://localhost:3000', 'http://localhost:5173'],
+      origin: allowedOrigins,
       credentials: true,
       methods: ['GET', 'POST'],
     },
     transports: ['websocket', 'polling'],
     allowEIO3: true,
+    path: '/socket.io',
   });
 
   io.use((socket, next) => {
