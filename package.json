@@ -7,6 +7,7 @@
     "build": "tsc",
     "start": "node dist/server-demo.js",
     "start:prod": "NODE_ENV=production node dist/server-demo.js",
+    "vercel-build": "echo 'No build needed - Vercel will use TypeScript directly'",
     "migrate": "node -r ts-node/register src/config/migrate.ts",
     "test:features": "bash test-production-features.sh",
     "logs:combined": "tail -f logs/combined-*.log",

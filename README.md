@@ -185,6 +185,45 @@ FRONTEND_URL=http://localhost:3000
 - Content Security Policy
 - HSTS enabled
 
+## 🚀 Deployment
+
+### Deploy to Vercel
+
+**Quick Deploy (5 minutes):**
+```bash
+# Install Vercel CLI
+npm install -g vercel
+
+# Login
+vercel login
+
+# Build
+npm run build
+
+# Deploy
+vercel --prod
+```
+
+See [QUICK_DEPLOY.md](./QUICK_DEPLOY.md) for step-by-step instructions.
+
+**Full Deployment Guide:**
+- [Quick Deploy Guide](./QUICK_DEPLOY.md) - 5-minute deployment
+- [Vercel Deployment Guide](./VERCEL_DEPLOYMENT_GUIDE.md) - Complete guide
+- [Pre-Deployment Checklist](./PRE_DEPLOYMENT_CHECKLIST.md) - Before you deploy
+
+### Deploy with PM2 (VPS/Server)
+
+```bash
+# Build
+npm run build
+
+# Start with PM2
+npm run pm2:start
+
+# Monitor
+npm run pm2:logs
+```
+
 ## 📖 Documentation
 
 - [Logging and Rate Limiting Guide](./LOGGING_AND_RATE_LIMITING.md)
