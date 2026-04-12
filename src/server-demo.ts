@@ -2,6 +2,9 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { createServer } from 'http';
+import helmet from 'helmet';
+import compression from 'compression';
+import mongoSanitize from 'express-mongo-sanitize';
 import { initializeSocket, getIO } from './services/socket';
 import path from 'path';
 import jwt from 'jsonwebtoken';
@@ -13,6 +16,19 @@ import {
   getFirebaseMenu,
   convertFirebaseOrderToMerchant 
 } from './services/firebase';
+import logger, { logAuthAttempt, logSecurity } from './utils/logger';
+import { apiLimiter, authLimiter, orderLimiter, menuLimiter, webhookLimiter } from './middleware/rateLimiter';
+import { errorHandler, notFoundHandler, asyncHandler, AppError } from './middleware/errorHandler';
+import { requestLogger, addRequestId, enhancedRequestLogger } from './middleware/requestLogger';
+import { sanitizeInput } from './middleware/sanitizer';
+import { securityAudit, trackAuthFailure, isIpBlocked, clearAuthFailures } from './middleware/securityAudit';
+import {
+  validateLogin,
+  validateSignup,
+  validateGoogleSignup,
+  validateMenuItem,
+  validateOrderStatus,
+} from './middleware/validator';
 
 dotenv.config();
 
@@ -30,9 +46,63 @@ const app = express();
 const server = createServer(app);
 const PORT = process.env.PORT || 5000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// Trust proxy - important for rate limiting behind reverse proxy
+app.set('trust proxy', 1);
+
+// Security middleware
+app.use(helmet({
+  contentSecurityPolicy: process.env.NODE_ENV === 'production' ? undefined : false,
+  crossOriginEmbedderPolicy: false,
+}));
+
+// Compression middleware
+app.use(compression());
+
+// ✅ CORS (FIXED)
+const allowedOrigins = [
+  "https://cyra-merchant.vercel.app",
+  "https://cyra-frontend.vercel.app",
+  "http://localhost:3000",
+  process.env.FRONTEND_URL,
+  ...(process.env.ALLOWED_ORIGINS?.split(',').map(o => o.trim()) || [])
+].filter((o): o is string => Boolean(o));
+
+logger.info('CORS allowed origins configured', { origins: allowedOrigins });
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    const isAllowed = allowedOrigins.some(o => origin.startsWith(o));
+    if (isAllowed) {
+      callback(null, true);
+    } else {
+      logger.warn("Blocked Origin", { origin, allowedOrigins });
+      logSecurity('CORS blocked origin', { origin, ip: 'unknown' });
+      callback(new Error("CORS not allowed"));
+    }
+  },
+  credentials: true,
+}));
+
+// Body parsing
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Sanitize data
+app.use(mongoSanitize());
+app.use(sanitizeInput);
+
+// Request ID and logging
+app.use(addRequestId);
+app.use(requestLogger);
+app.use(enhancedRequestLogger);
+
+// Security audit
+app.use(securityAudit);
+
+// Static files
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
 // Serve static files from the React app in production
@@ -70,21 +140,27 @@ let menuIdCounter = 1;
 // Auth middleware
 const authenticate = (req: AuthRequest, res: Response, next: NextFunction) => {
   const token = req.headers.authorization?.split(' ')[1];
-  console.log('🔐 Authentication attempt:', {
+  logger.debug('Authentication attempt', {
     hasToken: !!token,
-    tokenPreview: token ? token.substring(0, 20) + '...' : 'none'
+    ip: req.ip,
+    path: req.path,
+    requestId: (req as any).requestId,
   });
   
   if (!token) {
-    console.log('❌ No token provided');
-    return res.status(401).json({ error: 'No token provided' });
+    logSecurity('No token provided', { 
+      ip: req.ip, 
+      path: req.path,
+      requestId: (req as any).requestId,
+    });
+    return next(new AppError('No token provided', 401));
   }
   
   try {
     const jwtSecret = process.env.JWT_SECRET;
     if (!jwtSecret) {
-      console.error('❌ JWT_SECRET not configured in environment!');
-      return res.status(500).json({ error: 'Server configuration error' });
+      logger.error('JWT_SECRET not configured in environment!');
+      return next(new AppError('Server configuration error', 500));
     }
     
     const decoded = jwt.verify(token, jwtSecret) as any;
@@ -94,150 +170,47 @@ const authenticate = (req: AuthRequest, res: Response, next: NextFunction) => {
     const user = demoData.users.find(u => u.id === decoded.id);
     if (user && req.user) {
       req.user.restaurantName = user.restaurantName;
-      console.log('✅ Authenticated:', user.email);
+      logger.debug('User authenticated', { 
+        email: user.email, 
+        role: user.role,
+        requestId: (req as any).requestId,
+      });
     } else {
-      console.log('⚠️  Token valid but user not found:', decoded.id);
+      logSecurity('Token valid but user not found', { 
+        userId: decoded.id,
+        requestId: (req as any).requestId,
+      });
     }
     
     next();
   } catch (error: any) {
-    console.log('❌ Token verification failed:', error.message);
-    return res.status(401).json({ error: 'Invalid token' });
+    logSecurity('Token verification failed', { 
+      error: error.message, 
+      ip: req.ip,
+      requestId: (req as any).requestId,
+    });
+    return next(new AppError('Invalid token', 401));
   }
 };
 
 // Routes
-app.post('/api/auth/google', async (req, res) => {
-  try {
-    const { email, name, googleId } = req.body;
-    console.log('🔐 Google OAuth attempt for:', email);
-    
-    // Check if user exists
-    let user = demoData.users.find(u => u.email === email);
-    
-    if (user) {
-      // User exists - login
-      console.log('✅ Existing user found, logging in:', email);
-      const token = jwt.sign(
-        { id: user.id, email: user.email, role: user.role },
-        process.env.JWT_SECRET as string,
-        { expiresIn: '24h' }
-      );
-
-      return res.json({
-        token,
-        user: {
-          id: user.id,
-          email: user.email,
-          role: user.role,
-          name: user.name,
-          restaurantName: user.restaurantName,
-        },
-        isNewUser: false,
-      });
-    } else {
-      // New user - return flag to show signup form
-      console.log('📝 New Google user, needs signup:', email);
-      return res.json({
-        isNewUser: true,
-        email,
-        name,
-        googleId,
-      });
-    }
-  } catch (error) {
-    console.error('❌ Google OAuth error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.post('/api/auth/google-signup', async (req, res) => {
-  try {
-    const { name, email, role, restaurantName, googleId } = req.body;
-    console.log('📝 Google signup for:', email);
-
-    // Check if user already exists
-    const existingUser = demoData.users.find(u => u.email === email);
-    if (existingUser) {
-      return res.status(400).json({ error: 'User already exists with this email' });
-    }
-
-    // Validate input
-    if (!name || !email || !role || !restaurantName) {
-      return res.status(400).json({ error: 'All fields are required' });
-    }
-
-    if (!['admin', 'staff'].includes(role)) {
-      return res.status(400).json({ error: 'Invalid role specified' });
-    }
-
-    // Create new user (no password needed for Google OAuth)
-    const newUser = {
-      id: demoData.users.length + 1,
-      email,
-      password_hash: '', // No password for Google OAuth users
-      role,
-      name,
-      restaurantName,
-      googleId,
-    };
-
-    demoData.users.push(newUser);
-
-    // Generate token
-    const token = jwt.sign(
-      { id: newUser.id, email: newUser.email, role: newUser.role },
-      process.env.JWT_SECRET as string,
-      { expiresIn: '24h' }
-    );
-
-    console.log(`✅ New Google user registered: ${name} (${email}) as ${role}`);
-
-    res.status(201).json({
-      token,
-      user: {
-        id: newUser.id,
-        email: newUser.email,
-        role: newUser.role,
-        name: newUser.name,
-        restaurantName: newUser.restaurantName,
-      },
-    });
-  } catch (error) {
-    console.error('Google signup error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    console.log('🔐 Login attempt for:', email);
-    
-    const user = demoData.users.find(u => u.email === email);
-    
-    if (!user) {
-      console.log('❌ User not found:', email);
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    console.log('✓ User found:', email);
-    const isValidPassword = await bcrypt.compare(password, user.password_hash);
-    
-    if (!isValidPassword) {
-      console.log('❌ Invalid password for:', email);
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    console.log('✓ Password valid for:', email);
+app.post('/api/auth/google', authLimiter, asyncHandler(async (req: Request, res: Response) => {
+  const { email, name, googleId } = req.body;
+  logger.info('Google OAuth attempt', { email });
+  
+  // Check if user exists
+  let user = demoData.users.find(u => u.email === email);
+  
+  if (user) {
+    // User exists - login
+    logger.info('Existing user login', { email });
     const token = jwt.sign(
       { id: user.id, email: user.email, role: user.role },
       process.env.JWT_SECRET as string,
       { expiresIn: '24h' }
     );
 
-    console.log('✅ Login successful:', email);
-    res.json({
+    return res.json({
       token,
       user: {
         id: user.id,
@@ -246,171 +219,231 @@ app.post('/api/auth/login', async (req, res) => {
         name: user.name,
         restaurantName: user.restaurantName,
       },
+      isNewUser: false,
     });
-  } catch (error) {
-    console.error('❌ Login error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.post('/api/auth/signup', async (req, res) => {
-  try {
-    const { name, email, password, role, restaurantName } = req.body;
-
-    // Check if user already exists
-    const existingUser = demoData.users.find(u => u.email === email);
-    if (existingUser) {
-      return res.status(400).json({ error: 'User already exists with this email' });
-    }
-
-    // Validate input
-    if (!name || !email || !password || !role) {
-      return res.status(400).json({ error: 'All fields are required' });
-    }
-
-    if (password.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters long' });
-    }
-
-    if (!['admin', 'staff'].includes(role)) {
-      return res.status(400).json({ error: 'Invalid role specified' });
-    }
-
-    // Hash password
-    const password_hash = await bcrypt.hash(password, 10);
-
-    // Create new user
-    const newUser = {
-      id: demoData.users.length + 1,
+  } else {
+    // New user - return flag to show signup form
+    logger.info('New Google user needs signup', { email });
+    return res.json({
+      isNewUser: true,
       email,
-      password_hash,
-      role,
       name,
-      restaurantName,
-      created_at: new Date().toISOString(),
-    };
-
-    demoData.users.push(newUser);
-
-    // Generate token
-    const token = jwt.sign(
-      { id: newUser.id, email: newUser.email, role: newUser.role },
-      process.env.JWT_SECRET as string,
-      { expiresIn: '24h' }
-    );
-
-    console.log(`✅ New user registered: ${name} (${email}) as ${role}`);
-
-    res.status(201).json({
-      token,
-      user: {
-        id: newUser.id,
-        email: newUser.email,
-        role: newUser.role,
-        name: newUser.name,
-        restaurantName: newUser.restaurantName,
-      },
+      googleId,
     });
-  } catch (error) {
-    console.error('Signup error:', error);
-    res.status(500).json({ error: 'Internal server error' });
   }
-});
+}));
 
-app.get('/api/dashboard/stats', authenticate, (req, res) => {
-  console.log('📊 Dashboard stats requested');
-  console.log(`📊 Total orders in system: ${demoData.orders.length}`);
+app.post('/api/auth/google-signup', authLimiter, validateGoogleSignup, asyncHandler(async (req: Request, res: Response) => {
+  const { name, email, role, restaurantName, googleId } = req.body;
+  logger.info('Google signup', { email, role });
+
+  // Check if user already exists
+  const existingUser = demoData.users.find(u => u.email === email);
+  if (existingUser) {
+    throw new AppError('User already exists with this email', 400);
+  }
+
+  // Create new user (no password needed for Google OAuth)
+  const newUser = {
+    id: demoData.users.length + 1,
+    email,
+    password_hash: '', // No password for Google OAuth users
+    role,
+    name,
+    restaurantName,
+    googleId,
+  };
+
+  demoData.users.push(newUser);
+
+  // Generate token
+  const token = jwt.sign(
+    { id: newUser.id, email: newUser.email, role: newUser.role },
+    process.env.JWT_SECRET as string,
+    { expiresIn: '24h' }
+  );
+
+  logger.info('New Google user registered', { name, email, role });
+
+  res.status(201).json({
+    token,
+    user: {
+      id: newUser.id,
+      email: newUser.email,
+      role: newUser.role,
+      name: newUser.name,
+      restaurantName: newUser.restaurantName,
+    },
+  });
+}));
+
+app.post('/api/auth/login', authLimiter, validateLogin, asyncHandler(async (req: Request, res: Response) => {
+  const { email, password } = req.body;
+  const ip = req.ip || 'unknown';
   
-  try {
-    // Get today's date (start of day)
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    
-    // Filter today's orders
-    const todaysOrders = demoData.orders.filter(o => {
-      const orderDate = new Date(o.created_at);
-      orderDate.setHours(0, 0, 0, 0);
-      return orderDate.getTime() === today.getTime();
-    });
-    
-    // Get completed orders for debugging
-    const completedOrders = demoData.orders.filter(o => o.status === 'completed');
-    console.log(`📊 Completed orders: ${completedOrders.length}`);
-    completedOrders.forEach(o => {
-      console.log(`   - Order ${o.cyra_order_id}: ₹${o.total_amount}`);
-    });
-    
-    // Calculate total revenue (all completed orders)
-    const totalRevenue = completedOrders.reduce((sum, o) => sum + (o.total_amount || 0), 0);
-    
-    // Calculate today's revenue (only today's completed orders)
-    const todaysCompletedOrders = todaysOrders.filter(o => o.status === 'completed');
-    const todaysRevenue = todaysCompletedOrders.reduce((sum, o) => sum + (o.total_amount || 0), 0);
-    
-    console.log(`💰 Total Revenue: ₹${totalRevenue} from ${completedOrders.length} orders`);
-    console.log(`💰 Today's Revenue: ₹${todaysRevenue} from ${todaysCompletedOrders.length} orders`);
-    
-    // Calculate real stats from orders
-    const stats = {
-      orders: {
-        pending: demoData.orders.filter(o => o.status === 'pending').length,
-        preparing: demoData.orders.filter(o => o.status === 'preparing').length,
-        completed: completedOrders.length,
-        cancelled: demoData.orders.filter(o => o.status === 'cancelled').length,
-      },
-      revenue: totalRevenue,
-      todaysRevenue: todaysRevenue,
-      todaysOrders: {
-        total: todaysOrders.length,
-        pending: todaysOrders.filter(o => o.status === 'pending').length,
-        preparing: todaysOrders.filter(o => o.status === 'preparing').length,
-        completed: todaysCompletedOrders.length,
-        cancelled: todaysOrders.filter(o => o.status === 'cancelled').length,
-      },
-      recentOrders: demoData.orders
-        .slice(-10)
-        .reverse()
-        .map(o => ({
-          id: o.id,
-          cyra_order_id: o.cyra_order_id,
-          customer_name: o.customer_name,
-          customer_phone: o.customer_phone,
-          customer_email: o.customer_email,
-          delivery_address: o.delivery_address,
-          status: o.status,
-          total_amount: o.total_amount,
-          customer_notes: o.customer_notes,
-          created_at: o.created_at,
-          updated_at: o.updated_at,
-          items: o.items,
-        })),
-    };
-    
-    console.log('📊 Stats calculated:', {
-      pending: stats.orders.pending,
-      preparing: stats.orders.preparing,
-      completed: stats.orders.completed,
-      totalRevenue: stats.revenue,
-      todaysRevenue: stats.todaysRevenue,
-      todaysOrdersCount: stats.todaysOrders.total,
-      recentOrdersCount: stats.recentOrders.length,
-    });
-    
-    res.status(200).json(stats);
-  } catch (error) {
-    console.error('❌ Error calculating stats:', error);
-    // Return empty stats on error
-    res.status(200).json({
-      orders: { pending: 0, preparing: 0, completed: 0, cancelled: 0 },
-      revenue: 0,
-      todaysRevenue: 0,
-      todaysOrders: { total: 0, pending: 0, preparing: 0, completed: 0, cancelled: 0 },
-      recentOrders: [],
-    });
+  // Check if IP is blocked
+  if (isIpBlocked(ip)) {
+    logAuthAttempt(email, false, ip, { reason: 'IP blocked' });
+    throw new AppError('Too many failed attempts. Please try again later.', 429);
   }
-});
+  
+  logger.info('Login attempt', { email, ip, requestId: (req as any).requestId });
+  
+  const user = demoData.users.find(u => u.email === email);
+  
+  if (!user) {
+    trackAuthFailure(ip);
+    logAuthAttempt(email, false, ip, { reason: 'User not found' });
+    throw new AppError('Invalid credentials', 401);
+  }
 
-app.get('/api/orders', authenticate, (req, res) => {
+  const isValidPassword = await bcrypt.compare(password, user.password_hash);
+  
+  if (!isValidPassword) {
+    trackAuthFailure(ip);
+    logAuthAttempt(email, false, ip, { reason: 'Invalid password' });
+    throw new AppError('Invalid credentials', 401);
+  }
+
+  // Clear failed attempts on successful login
+  clearAuthFailures(ip);
+
+  const token = jwt.sign(
+    { id: user.id, email: user.email, role: user.role },
+    process.env.JWT_SECRET as string,
+    { expiresIn: '24h' }
+  );
+
+  logAuthAttempt(email, true, ip, { role: user.role });
+  res.json({
+    token,
+    user: {
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      name: user.name,
+      restaurantName: user.restaurantName,
+    },
+  });
+}));
+
+app.post('/api/auth/signup', authLimiter, validateSignup, asyncHandler(async (req: Request, res: Response) => {
+  const { name, email, password, role, restaurantName } = req.body;
+
+  // Check if user already exists
+  const existingUser = demoData.users.find(u => u.email === email);
+  if (existingUser) {
+    throw new AppError('User already exists with this email', 400);
+  }
+
+  // Hash password
+  const password_hash = await bcrypt.hash(password, 10);
+
+  // Create new user
+  const newUser = {
+    id: demoData.users.length + 1,
+    email,
+    password_hash,
+    role,
+    name,
+    restaurantName,
+    created_at: new Date().toISOString(),
+  };
+
+  demoData.users.push(newUser);
+
+  // Generate token
+  const token = jwt.sign(
+    { id: newUser.id, email: newUser.email, role: newUser.role },
+    process.env.JWT_SECRET as string,
+    { expiresIn: '24h' }
+  );
+
+  logger.info('New user registered', { name, email, role });
+
+  res.status(201).json({
+    token,
+    user: {
+      id: newUser.id,
+      email: newUser.email,
+      role: newUser.role,
+      name: newUser.name,
+      restaurantName: newUser.restaurantName,
+    },
+  });
+}));
+
+app.get('/api/dashboard/stats', authenticate, apiLimiter, asyncHandler(async (req: Request, res: Response) => {
+  logger.debug('Dashboard stats requested');
+  
+  // Get today's date (start of day)
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  
+  // Filter today's orders
+  const todaysOrders = demoData.orders.filter(o => {
+    const orderDate = new Date(o.created_at);
+    orderDate.setHours(0, 0, 0, 0);
+    return orderDate.getTime() === today.getTime();
+  });
+  
+  // Get completed orders
+  const completedOrders = demoData.orders.filter(o => o.status === 'completed');
+  
+  // Calculate total revenue (all completed orders)
+  const totalRevenue = completedOrders.reduce((sum, o) => sum + (o.total_amount || 0), 0);
+  
+  // Calculate today's revenue (only today's completed orders)
+  const todaysCompletedOrders = todaysOrders.filter(o => o.status === 'completed');
+  const todaysRevenue = todaysCompletedOrders.reduce((sum, o) => sum + (o.total_amount || 0), 0);
+  
+  logger.debug('Stats calculated', {
+    totalOrders: demoData.orders.length,
+    totalRevenue,
+    todaysRevenue,
+    todaysOrdersCount: todaysOrders.length,
+  });
+  
+  // Calculate real stats from orders
+  const stats = {
+    orders: {
+      pending: demoData.orders.filter(o => o.status === 'pending').length,
+      preparing: demoData.orders.filter(o => o.status === 'preparing').length,
+      completed: completedOrders.length,
+      cancelled: demoData.orders.filter(o => o.status === 'cancelled').length,
+    },
+    revenue: totalRevenue,
+    todaysRevenue: todaysRevenue,
+    todaysOrders: {
+      total: todaysOrders.length,
+      pending: todaysOrders.filter(o => o.status === 'pending').length,
+      preparing: todaysOrders.filter(o => o.status === 'preparing').length,
+      completed: todaysCompletedOrders.length,
+      cancelled: todaysOrders.filter(o => o.status === 'cancelled').length,
+    },
+    recentOrders: demoData.orders
+      .slice(-10)
+      .reverse()
+      .map(o => ({
+        id: o.id,
+        cyra_order_id: o.cyra_order_id,
+        customer_name: o.customer_name,
+        customer_phone: o.customer_phone,
+        customer_email: o.customer_email,
+        delivery_address: o.delivery_address,
+        status: o.status,
+        total_amount: o.total_amount,
+        customer_notes: o.customer_notes,
+        created_at: o.created_at,
+        updated_at: o.updated_at,
+        items: o.items,
+      })),
+  };
+  
+  res.status(200).json(stats);
+}));
+
+app.get('/api/orders', authenticate, apiLimiter, asyncHandler(async (req: Request, res: Response) => {
   const { status } = req.query;
   let orders = demoData.orders;
   
@@ -418,16 +451,17 @@ app.get('/api/orders', authenticate, (req, res) => {
     orders = orders.filter(o => o.status === status);
   }
   
+  logger.debug('Orders fetched', { count: orders.length, status });
   res.json(orders.reverse());
-});
+}));
 
-app.put('/api/orders/:id/status', authenticate, (req, res) => {
+app.put('/api/orders/:id/status', authenticate, apiLimiter, validateOrderStatus, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const { status } = req.body;
   
   const order = demoData.orders.find(o => o.id === parseInt(id));
   if (!order) {
-    return res.status(404).json({ error: 'Order not found' });
+    throw new AppError('Order not found', 404);
   }
   
   order.status = status;
@@ -438,18 +472,19 @@ app.put('/api/orders/:id/status', authenticate, (req, res) => {
     updateFirebaseOrderStatus(order.firebase_key, status);
   }
   
-  const io = require('./services/socket').getIO();
+  const io = getIO();
   io.emit('order:updated', order);
   
+  logger.info('Order status updated', { orderId: id, status });
   res.json(order);
-});
+}));
 
-app.post('/api/orders/:id/cancel', authenticate, (req, res) => {
+app.post('/api/orders/:id/cancel', authenticate, apiLimiter, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   
   const order = demoData.orders.find(o => o.id === parseInt(id));
   if (!order) {
-    return res.status(404).json({ error: 'Order not found' });
+    throw new AppError('Order not found', 404);
   }
   
   order.status = 'cancelled';
@@ -460,21 +495,25 @@ app.post('/api/orders/:id/cancel', authenticate, (req, res) => {
     updateFirebaseOrderStatus(order.firebase_key, 'cancelled');
   }
   
-  const io = require('./services/socket').getIO();
+  const io = getIO();
   io.emit('order:updated', order);
   
+  logger.info('Order cancelled', { orderId: id });
   res.json(order);
-});
+}));
 
-app.get('/api/menu', authenticate, (req, res) => {
-  console.log(`📋 Fetching menu items. Total: ${demoData.menuItems.length}`);
+app.get('/api/menu', authenticate, apiLimiter, asyncHandler(async (req: Request, res: Response) => {
+  logger.debug('Menu items fetched', { 
+    count: demoData.menuItems.length,
+    requestId: (req as any).requestId,
+  });
   res.json(demoData.menuItems);
-});
+}));
 
-app.post('/api/menu', authenticate, (req: AuthRequest, res: Response) => {
+app.post('/api/menu', authenticate, menuLimiter, validateMenuItem, asyncHandler(async (req: AuthRequest, res: Response) => {
   const { name, description, price, category, is_available, phase } = req.body;
   
-  console.log('📝 Creating new menu item:', name);
+  logger.info('Creating new menu item', { name, category });
   
   const newItem = {
     id: menuIdCounter++,
@@ -482,7 +521,7 @@ app.post('/api/menu', authenticate, (req: AuthRequest, res: Response) => {
     description,
     price: parseFloat(price),
     category,
-    phase: phase || 'all', // Default to 'all' if not specified
+    phase: phase || 'all',
     restaurantName: req.user?.restaurantName || 'Unknown Restaurant',
     image_url: null,
     is_available: is_available !== false,
@@ -491,24 +530,24 @@ app.post('/api/menu', authenticate, (req: AuthRequest, res: Response) => {
   };
   
   demoData.menuItems.push(newItem);
-  console.log(`✅ Item added to memory. Total items: ${demoData.menuItems.length}`);
   
   // Sync to Firebase
   syncMenuToFirebase(demoData.menuItems);
   
-  const io = require('./services/socket').getIO();
+  const io = getIO();
   io.emit('menu:updated', { action: 'create', item: newItem });
   
+  logger.info('Menu item created', { id: newItem.id, name: newItem.name });
   res.status(201).json(newItem);
-});
+}));
 
-app.put('/api/menu/:id', authenticate, (req: AuthRequest, res: Response) => {
+app.put('/api/menu/:id', authenticate, menuLimiter, validateMenuItem, asyncHandler(async (req: AuthRequest, res: Response) => {
   const { id } = req.params;
   const { name, description, price, category, is_available, phase } = req.body;
   
   const item = demoData.menuItems.find(m => m.id === parseInt(id));
   if (!item) {
-    return res.status(404).json({ error: 'Menu item not found' });
+    throw new AppError('Menu item not found', 404);
   }
   
   Object.assign(item, {
@@ -525,18 +564,19 @@ app.put('/api/menu/:id', authenticate, (req: AuthRequest, res: Response) => {
   // Sync to Firebase
   syncMenuToFirebase(demoData.menuItems);
   
-  const io = require('./services/socket').getIO();
+  const io = getIO();
   io.emit('menu:updated', { action: 'update', item });
   
+  logger.info('Menu item updated', { id, name });
   res.json(item);
-});
+}));
 
-app.delete('/api/menu/:id', authenticate, (req, res) => {
+app.delete('/api/menu/:id', authenticate, menuLimiter, asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
   const index = demoData.menuItems.findIndex(m => m.id === parseInt(id));
   
   if (index === -1) {
-    return res.status(404).json({ error: 'Menu item not found' });
+    throw new AppError('Menu item not found', 404);
   }
   
   const [item] = demoData.menuItems.splice(index, 1);
@@ -544,14 +584,15 @@ app.delete('/api/menu/:id', authenticate, (req, res) => {
   // Sync to Firebase
   syncMenuToFirebase(demoData.menuItems);
   
-  const io = require('./services/socket').getIO();
+  const io = getIO();
   io.emit('menu:updated', { action: 'delete', item });
   
+  logger.info('Menu item deleted', { id });
   res.json({ message: 'Menu item deleted' });
-});
+}));
 
 // Webhook for demo - simulate CYRA orders
-app.post('/api/webhook/cyra/order', (req, res) => {
+app.post('/api/webhook/cyra/order', webhookLimiter, asyncHandler(async (req: Request, res: Response) => {
   const { order_id, customer, items, total_amount, notes } = req.body;
   
   const newOrder = {
@@ -574,11 +615,12 @@ app.post('/api/webhook/cyra/order', (req, res) => {
   
   demoData.orders.push(newOrder);
   
-  const io = require('./services/socket').getIO();
+  const io = getIO();
   io.emit('order:new', newOrder);
   
+  logger.info('New order received via webhook', { orderId: order_id });
   res.status(201).json({ success: true, order: newOrder });
-});
+}));
 
 // Health check
 app.get('/health', (req, res) => {
@@ -598,38 +640,53 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Debug endpoint to see all orders
-app.get('/debug/orders', (req, res) => {
-  const ordersWithDetails = demoData.orders.map(o => ({
-    id: o.id,
-    cyra_order_id: o.cyra_order_id,
-    customer_name: o.customer_name,
-    status: o.status,
-    total_amount: o.total_amount,
-    created_at: o.created_at,
-  }));
-  
-  const completedOrders = demoData.orders.filter(o => o.status === 'completed');
-  const totalRevenue = completedOrders.reduce((sum, o) => sum + (o.total_amount || 0), 0);
-  
-  res.json({
-    totalOrders: demoData.orders.length,
-    orders: ordersWithDetails,
-    completedOrders: completedOrders.length,
-    totalRevenue: totalRevenue,
-    ordersByStatus: {
-      pending: demoData.orders.filter(o => o.status === 'pending').length,
-      preparing: demoData.orders.filter(o => o.status === 'preparing').length,
-      completed: completedOrders.length,
-      cancelled: demoData.orders.filter(o => o.status === 'cancelled').length,
-    }
+// Debug endpoint to see all orders (only in development)
+if (process.env.NODE_ENV !== 'production') {
+  app.get('/debug/orders', (req, res) => {
+    const ordersWithDetails = demoData.orders.map(o => ({
+      id: o.id,
+      cyra_order_id: o.cyra_order_id,
+      customer_name: o.customer_name,
+      status: o.status,
+      total_amount: o.total_amount,
+      created_at: o.created_at,
+    }));
+    
+    const completedOrders = demoData.orders.filter(o => o.status === 'completed');
+    const totalRevenue = completedOrders.reduce((sum, o) => sum + (o.total_amount || 0), 0);
+    
+    res.json({
+      totalOrders: demoData.orders.length,
+      orders: ordersWithDetails,
+      completedOrders: completedOrders.length,
+      totalRevenue: totalRevenue,
+      ordersByStatus: {
+        pending: demoData.orders.filter(o => o.status === 'pending').length,
+        preparing: demoData.orders.filter(o => o.status === 'preparing').length,
+        completed: completedOrders.length,
+        cancelled: demoData.orders.filter(o => o.status === 'cancelled').length,
+      }
+    });
   });
-});
+}
+
+// Serve React app for all other routes in production
+if (process.env.NODE_ENV === 'production') {
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, '../../frontend/dist/index.html'));
+  });
+}
+
+// 404 handler
+app.use(notFoundHandler);
+
+// Error handler (must be last)
+app.use(errorHandler);
 
 // Initialize menu from Firebase
 async function initializeMenu() {
   try {
-    console.log('📥 Loading menu from Firebase...');
+    logger.info('Loading menu from Firebase...');
     const firebaseMenu = await getFirebaseMenu();
     
     if (firebaseMenu && Object.keys(firebaseMenu).length > 0) {
@@ -641,7 +698,7 @@ async function initializeMenu() {
         price: item.price,
         category: item.category,
         phase: item.phase || 'all',
-        restaurantName: item.restaurantName || 'Demo Kitchen', // Add restaurant name with fallback
+        restaurantName: item.restaurantName || 'Demo Kitchen',
         image_url: item.imageUrl,
         is_available: item.isAvailable,
         created_at: item.createdAt || new Date().toISOString(),
@@ -652,15 +709,14 @@ async function initializeMenu() {
       const maxId = Math.max(...demoData.menuItems.map(item => item.id), 0);
       menuIdCounter = maxId + 1;
       
-      console.log(`✅ Loaded ${demoData.menuItems.length} menu items from Firebase`);
+      logger.info(`Loaded ${demoData.menuItems.length} menu items from Firebase`);
       
       // Re-sync to Firebase to ensure all items have restaurantName
-      console.log('🔄 Re-syncing menu to add missing fields...');
       await syncMenuToFirebase(demoData.menuItems);
-      console.log('✅ Menu re-synced with restaurant names');
+      logger.info('Menu re-synced with restaurant names');
     } else {
       // No items in Firebase, create default items
-      console.log('📝 No menu items in Firebase, creating defaults...');
+      logger.info('No menu items in Firebase, creating defaults...');
       demoData.menuItems = [
         {
           id: 1,
@@ -693,10 +749,10 @@ async function initializeMenu() {
       
       // Sync defaults to Firebase
       await syncMenuToFirebase(demoData.menuItems);
-      console.log('✅ Default menu items synced to Firebase');
+      logger.info('Default menu items synced to Firebase');
     }
   } catch (error) {
-    console.error('❌ Error loading menu from Firebase:', error);
+    logger.error('Error loading menu from Firebase', { error });
     // Fallback to default items
     demoData.menuItems = [
       {
@@ -717,74 +773,87 @@ async function initializeMenu() {
   }
 }
 
-// Serve React app for all other routes in production
-if (process.env.NODE_ENV === 'production') {
-  app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../../frontend/dist/index.html'));
-  });
-}
-
 // Initialize and start server
 async function startServer() {
-  // Initialize Socket.io FIRST
-  initializeSocket(server);
-  console.log('✅ Socket.io initialized');
-  
-  // Load menu from Firebase
-  await initializeMenu();
-  
-  // Start Firebase listener for orders AFTER Socket.io is ready
-  console.log('🔄 Setting up Firebase order listener...');
-  listenToFirebaseOrders((firebaseOrder) => {
-    console.log('');
-    console.log('═══════════════════════════════════════');
-    console.log('📱 NEW ORDER FROM FIREBASE!');
-    console.log('═══════════════════════════════════════');
-    console.log('   Order ID:', firebaseOrder.orderId);
-    console.log('   Customer:', firebaseOrder.customerName);
-    console.log('   Phone:', firebaseOrder.customerPhone || 'N/A');
-    console.log('   Email:', firebaseOrder.customerEmail || 'N/A');
-    if (firebaseOrder.deliveryAddress) {
-      console.log('   📍 Delivery Address:');
-      console.log('      ', firebaseOrder.deliveryAddress.fullAddress || 
-                  `${firebaseOrder.deliveryAddress.address}, ${firebaseOrder.deliveryAddress.city}, ${firebaseOrder.deliveryAddress.state} - ${firebaseOrder.deliveryAddress.pincode}`);
-    }
-    console.log('   Total: ₹', firebaseOrder.totalAmount);
-    console.log('   Items:', firebaseOrder.items?.length || 0);
-    console.log('   Status:', firebaseOrder.status);
-    console.log('   Firebase Key:', firebaseOrder.firebaseKey);
-    console.log('───────────────────────────────────────');
+  try {
+    // Initialize Socket.io FIRST
+    initializeSocket(server);
+    logger.info('Socket.io initialized');
     
-    const merchantOrder: any = convertFirebaseOrderToMerchant(firebaseOrder);
-    merchantOrder.id = orderIdCounter++;
+    // Load menu from Firebase
+    await initializeMenu();
     
-    demoData.orders.push(merchantOrder);
-    console.log(`✅ Order added to merchant system!`);
-    console.log(`📊 Total orders in system: ${demoData.orders.length}`);
-    console.log('═══════════════════════════════════════');
-    console.log('');
+    // Start Firebase listener for orders AFTER Socket.io is ready
+    logger.info('Setting up Firebase order listener...');
+    listenToFirebaseOrders((firebaseOrder) => {
+      logger.info('New order from Firebase', {
+        orderId: firebaseOrder.orderId,
+        customer: firebaseOrder.customerName,
+        total: firebaseOrder.totalAmount,
+        items: firebaseOrder.items?.length || 0,
+      });
+      
+      const merchantOrder: any = convertFirebaseOrderToMerchant(firebaseOrder);
+      merchantOrder.id = orderIdCounter++;
+      
+      demoData.orders.push(merchantOrder);
+      logger.info('Order added to merchant system', {
+        orderId: merchantOrder.id,
+        totalOrders: demoData.orders.length,
+      });
+      
+      // Emit to connected clients
+      try {
+        const io = getIO();
+        io.emit('order:new', merchantOrder);
+        logger.debug('Order broadcasted to connected clients');
+      } catch (error) {
+        logger.error('Error broadcasting order', { error });
+      }
+    });
     
-    // Emit to connected clients
-    try {
-      const io = getIO();
-      io.emit('order:new', merchantOrder);
-      console.log('📡 Order broadcasted to connected clients');
-    } catch (error) {
-      console.error('❌ Error broadcasting order:', error);
-    }
-  });
-  
-  // Start server
-  server.listen(PORT, () => {
-    console.log(`\n🚀 Server running in DEMO MODE on port ${PORT}`);
-    console.log(`🔥 Firebase integration: ACTIVE`);
-    console.log(`📊 Database: ${process.env.FIREBASE_DATABASE_URL}`);
-    console.log(`📋 Menu items loaded: ${demoData.menuItems.length}`);
-    console.log(`\n📝 Login credentials:`);
-    console.log(`   Email: admin@kitchen.com`);
-    console.log(`   Password: admin123\n`);
-  });
+    // Start server
+    server.listen(PORT, () => {
+      logger.info(`Server running in DEMO MODE on port ${PORT}`);
+      logger.info(`Firebase integration: ACTIVE`);
+      logger.info(`Database: ${process.env.FIREBASE_DATABASE_URL}`);
+      logger.info(`Menu items loaded: ${demoData.menuItems.length}`);
+      logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
+      logger.info('Login credentials: admin@kitchen.com / admin123');
+    });
+  } catch (error) {
+    logger.error('Failed to start server', { error });
+    process.exit(1);
+  }
 }
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  logger.info('SIGTERM signal received: closing HTTP server');
+  server.close(() => {
+    logger.info('HTTP server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  logger.info('SIGINT signal received: closing HTTP server');
+  server.close(() => {
+    logger.info('HTTP server closed');
+    process.exit(0);
+  });
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception', { error: error.message, stack: error.stack });
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection', { reason, promise });
+  process.exit(1);
+});
 
 // Start the server
 startServer();
