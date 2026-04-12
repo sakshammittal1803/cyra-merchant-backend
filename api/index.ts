@@ -1,32 +1,24 @@
-import express, { Request, Response, NextFunction } from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import helmet from 'helmet';
-import compression from 'compression';
-import mongoSanitize from 'express-mongo-sanitize';
-import path from 'path';
-import jwt from 'jsonwebtoken';
-import bcrypt from 'bcryptjs';
-import { 
-  updateFirebaseOrderStatus, 
-  syncMenuToFirebase,
-  getFirebaseMenu,
-} from '../src/services/firebase';
-import logger, { logAuthAttempt, logSecurity } from '../src/utils/logger';
-import { apiLimiter, authLimiter, orderLimiter, menuLimiter, webhookLimiter } from '../src/middleware/rateLimiter';
-import { errorHandler, notFoundHandler, asyncHandler, AppError } from '../src/middleware/errorHandler';
-import { requestLogger, addRequestId, enhancedRequestLogger } from '../src/middleware/requestLogger';
-import { sanitizeInput } from '../src/middleware/sanitizer';
-import { securityAudit, trackAuthFailure, isIpBlocked, clearAuthFailures } from '../src/middleware/securityAudit';
-import {
-  validateLogin,
-  validateSignup,
-  validateGoogleSignup,
-  validateMenuItem,
-  validateOrderStatus,
-} from '../src/middleware/validator';
+import * as express from 'express';
+import { Request, Response, NextFunction } from 'express';
+import * as cors from 'cors';
+import * as helmet from 'helmet';
+import * as compression from 'compression';
+import * as mongoSanitize from 'express-mongo-sanitize';
+import * as jwt from 'jsonwebtoken';
+import * as bcrypt from 'bcryptjs';
 
-dotenv.config();
+// Simple logger for serverless
+const logger = {
+  info: (msg: string, meta?: any) => console.log('[INFO]', msg, meta || ''),
+  error: (msg: string, meta?: any) => console.error('[ERROR]', msg, meta || ''),
+  warn: (msg: string, meta?: any) => console.warn('[WARN]', msg, meta || ''),
+  debug: (msg: string, meta?: any) => console.log('[DEBUG]', msg, meta || ''),
+};
+
+const logSecurity = (msg: string, meta?: any) => console.log('[SECURITY]', msg, meta || '');
+const logAuthAttempt = (email: string, success: boolean, ip: string, meta?: any) => {
+  console.log('[AUTH]', { email, success, ip, ...meta });
+};
 
 // Extend Express Request type to include user
 interface AuthRequest extends Request {
@@ -37,6 +29,128 @@ interface AuthRequest extends Request {
     restaurantName?: string;
   };
 }
+
+// Simple error handler
+class AppError extends Error {
+  statusCode: number;
+  constructor(message: string, statusCode: number) {
+    super(message);
+    this.statusCode = statusCode;
+  }
+}
+
+const asyncHandler = (fn: Function) => {
+  return (req: Request, res: Response, next: NextFunction) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+};
+
+// Simple rate limiting (in-memory)
+const rateLimitStore = new Map<string, { count: number; resetTime: number }>();
+
+const createRateLimiter = (maxRequests: number, windowMs: number) => {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const key = req.ip || 'unknown';
+    const now = Date.now();
+    const record = rateLimitStore.get(key);
+
+    if (!record || now > record.resetTime) {
+      rateLimitStore.set(key, { count: 1, resetTime: now + windowMs });
+      return next();
+    }
+
+    if (record.count >= maxRequests) {
+      return res.status(429).json({
+        error: 'Too many requests',
+        message: 'Please try again later',
+      });
+    }
+
+    record.count++;
+    next();
+  };
+};
+
+const apiLimiter = createRateLimiter(100, 15 * 60 * 1000);
+const authLimiter = createRateLimiter(5, 15 * 60 * 1000);
+const orderLimiter = createRateLimiter(10, 60 * 1000);
+const menuLimiter = createRateLimiter(30, 60 * 1000);
+const webhookLimiter = createRateLimiter(50, 60 * 1000);
+
+// Simple input sanitizer
+const sanitizeInput = (req: Request, res: Response, next: NextFunction) => {
+  if (req.body) {
+    req.body = JSON.parse(JSON.stringify(req.body).replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ''));
+  }
+  next();
+};
+
+// Simple validators
+const validateLogin = (req: Request, res: Response, next: NextFunction) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password required' });
+  }
+  next();
+};
+
+const validateSignup = (req: Request, res: Response, next: NextFunction) => {
+  const { name, email, password, role, restaurantName } = req.body;
+  if (!name || !email || !password || !role || !restaurantName) {
+    return res.status(400).json({ error: 'All fields required' });
+  }
+  next();
+};
+
+const validateGoogleSignup = (req: Request, res: Response, next: NextFunction) => {
+  const { name, email, role, restaurantName } = req.body;
+  if (!name || !email || !role || !restaurantName) {
+    return res.status(400).json({ error: 'All fields required' });
+  }
+  next();
+};
+
+const validateMenuItem = (req: Request, res: Response, next: NextFunction) => {
+  const { name, price, category } = req.body;
+  if (!name || !price || !category) {
+    return res.status(400).json({ error: 'Name, price, and category required' });
+  }
+  next();
+};
+
+const validateOrderStatus = (req: Request, res: Response, next: NextFunction) => {
+  const { status } = req.body;
+  const validStatuses = ['pending', 'preparing', 'completed', 'cancelled'];
+  if (!status || !validStatuses.includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+  next();
+};
+
+// Auth failure tracking
+const authFailures = new Map<string, { count: number; lastAttempt: number }>();
+
+const trackAuthFailure = (ip: string) => {
+  const record = authFailures.get(ip) || { count: 0, lastAttempt: Date.now() };
+  record.count++;
+  record.lastAttempt = Date.now();
+  authFailures.set(ip, record);
+};
+
+const isIpBlocked = (ip: string): boolean => {
+  const record = authFailures.get(ip);
+  if (!record) return false;
+  const now = Date.now();
+  if (now - record.lastAttempt > 15 * 60 * 1000) {
+    authFailures.delete(ip);
+    return false;
+  }
+  return record.count >= 10;
+};
+
+const clearAuthFailures = (ip: string) => {
+  authFailures.delete(ip);
+};
 
 const app = express();
 
@@ -87,14 +201,6 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Sanitize data
 app.use(mongoSanitize());
 app.use(sanitizeInput);
-
-// Request ID and logging
-app.use(addRequestId);
-app.use(requestLogger);
-app.use(enhancedRequestLogger);
-
-// Security audit
-app.use(securityAudit);
 
 // In-memory storage for demo
 const demoData = {
@@ -159,12 +265,10 @@ const authenticate = (req: AuthRequest, res: Response, next: NextFunction) => {
       logger.debug('User authenticated', { 
         email: user.email, 
         role: user.role,
-        requestId: (req as any).requestId,
       });
     } else {
       logSecurity('Token valid but user not found', { 
         userId: decoded.id,
-        requestId: (req as any).requestId,
       });
     }
     
@@ -173,7 +277,6 @@ const authenticate = (req: AuthRequest, res: Response, next: NextFunction) => {
     logSecurity('Token verification failed', { 
       error: error.message, 
       ip: req.ip,
-      requestId: (req as any).requestId,
     });
     return next(new AppError('Invalid token', 401));
   }
@@ -273,7 +376,7 @@ app.post('/api/auth/login', authLimiter, validateLogin, asyncHandler(async (req:
     throw new AppError('Too many failed attempts. Please try again later.', 429);
   }
   
-  logger.info('Login attempt', { email, ip, requestId: (req as any).requestId });
+  logger.info('Login attempt', { email, ip });
   
   const user = demoData.users.find(u => u.email === email);
   
@@ -453,11 +556,6 @@ app.put('/api/orders/:id/status', authenticate, apiLimiter, validateOrderStatus,
   order.status = status;
   order.updated_at = new Date().toISOString();
   
-  // Update in Firebase if it has a firebase_key
-  if (order.firebase_key) {
-    updateFirebaseOrderStatus(order.firebase_key, status);
-  }
-  
   logger.info('Order status updated', { orderId: id, status });
   res.json(order);
 }));
@@ -473,11 +571,6 @@ app.post('/api/orders/:id/cancel', authenticate, apiLimiter, asyncHandler(async 
   order.status = 'cancelled';
   order.updated_at = new Date().toISOString();
   
-  // Update in Firebase if it has a firebase_key
-  if (order.firebase_key) {
-    updateFirebaseOrderStatus(order.firebase_key, 'cancelled');
-  }
-  
   logger.info('Order cancelled', { orderId: id });
   res.json(order);
 }));
@@ -485,7 +578,6 @@ app.post('/api/orders/:id/cancel', authenticate, apiLimiter, asyncHandler(async 
 app.get('/api/menu', authenticate, apiLimiter, asyncHandler(async (req: Request, res: Response) => {
   logger.debug('Menu items fetched', { 
     count: demoData.menuItems.length,
-    requestId: (req as any).requestId,
   });
   res.json(demoData.menuItems);
 }));
@@ -511,9 +603,6 @@ app.post('/api/menu', authenticate, menuLimiter, validateMenuItem, asyncHandler(
   
   demoData.menuItems.push(newItem);
   
-  // Sync to Firebase
-  syncMenuToFirebase(demoData.menuItems);
-  
   logger.info('Menu item created', { id: newItem.id, name: newItem.name });
   res.status(201).json(newItem);
 }));
@@ -538,9 +627,6 @@ app.put('/api/menu/:id', authenticate, menuLimiter, validateMenuItem, asyncHandl
     updated_at: new Date().toISOString(),
   });
   
-  // Sync to Firebase
-  syncMenuToFirebase(demoData.menuItems);
-  
   logger.info('Menu item updated', { id, name });
   res.json(item);
 }));
@@ -554,9 +640,6 @@ app.delete('/api/menu/:id', authenticate, menuLimiter, asyncHandler(async (req: 
   }
   
   const [item] = demoData.menuItems.splice(index, 1);
-  
-  // Sync to Firebase
-  syncMenuToFirebase(demoData.menuItems);
   
   logger.info('Menu item deleted', { id });
   res.json({ message: 'Menu item deleted' });
@@ -625,10 +708,22 @@ app.get('/', (req, res) => {
 });
 
 // 404 handler
-app.use(notFoundHandler);
+app.use((req, res, next) => {
+  res.status(404).json({ error: 'Not found' });
+});
 
 // Error handler (must be last)
-app.use(errorHandler);
+app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+  const statusCode = err.statusCode || 500;
+  const message = err.message || 'Internal server error';
+  
+  logger.error(message, { statusCode, path: req.path });
+  
+  res.status(statusCode).json({
+    error: message,
+    ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
+  });
+});
 
 // Export for Vercel serverless
 export default app;
