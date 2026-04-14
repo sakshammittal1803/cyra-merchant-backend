@@ -83,6 +83,61 @@ app.get('/', (req, res) => {
   });
 });
 
+// Signup endpoint
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    const { name, email, password, role, restaurantName } = req.body;
+    
+    // Validation
+    if (!name || !email || !password || !role || !restaurantName) {
+      return res.status(400).json({ error: 'All fields are required' });
+    }
+    
+    // Check if user already exists
+    const existingUser = demoData.users.find(u => u.email === email);
+    if (existingUser) {
+      return res.status(400).json({ error: 'User already exists' });
+    }
+    
+    // Hash password
+    const password_hash = await bcrypt.hash(password, 10);
+    
+    // Create new user
+    const newUser = {
+      id: demoData.users.length + 1,
+      email,
+      password_hash,
+      role,
+      name,
+      restaurantName
+    };
+    
+    demoData.users.push(newUser);
+    
+    // Generate token
+    const token = jwt.sign(
+      { id: newUser.id, email: newUser.email, role: newUser.role },
+      process.env.JWT_SECRET || 'fallback_secret',
+      { expiresIn: '24h' }
+    );
+    
+    res.status(201).json({
+      token,
+      user: {
+        id: newUser.id,
+        email: newUser.email,
+        role: newUser.role,
+        name: newUser.name,
+        restaurantName: newUser.restaurantName
+      }
+    });
+  } catch (error) {
+    console.error('Signup error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Login endpoint
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -125,12 +180,132 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// Menu endpoints
 app.get('/api/menu', authenticate, (req, res) => {
   res.json(demoData.menuItems);
 });
 
+app.post('/api/menu', authenticate, (req, res) => {
+  try {
+    const { name, description, price, category, image, available } = req.body;
+    
+    if (!name || !price) {
+      return res.status(400).json({ error: 'Name and price are required' });
+    }
+    
+    const newItem = {
+      id: demoData.menuItems.length + 1,
+      name,
+      description: description || '',
+      price: parseFloat(price),
+      category: category || 'Other',
+      image: image || '',
+      available: available !== false,
+      createdAt: new Date().toISOString()
+    };
+    
+    demoData.menuItems.push(newItem);
+    res.status(201).json(newItem);
+  } catch (error) {
+    console.error('Create menu item error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.put('/api/menu/:id', authenticate, (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, description, price, category, image, available } = req.body;
+    
+    const itemIndex = demoData.menuItems.findIndex(item => item.id === parseInt(id));
+    
+    if (itemIndex === -1) {
+      return res.status(404).json({ error: 'Menu item not found' });
+    }
+    
+    const updatedItem = {
+      ...demoData.menuItems[itemIndex],
+      name: name || demoData.menuItems[itemIndex].name,
+      description: description !== undefined ? description : demoData.menuItems[itemIndex].description,
+      price: price !== undefined ? parseFloat(price) : demoData.menuItems[itemIndex].price,
+      category: category || demoData.menuItems[itemIndex].category,
+      image: image !== undefined ? image : demoData.menuItems[itemIndex].image,
+      available: available !== undefined ? available : demoData.menuItems[itemIndex].available,
+      updatedAt: new Date().toISOString()
+    };
+    
+    demoData.menuItems[itemIndex] = updatedItem;
+    res.json(updatedItem);
+  } catch (error) {
+    console.error('Update menu item error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.delete('/api/menu/:id', authenticate, (req, res) => {
+  try {
+    const { id } = req.params;
+    const itemIndex = demoData.menuItems.findIndex(item => item.id === parseInt(id));
+    
+    if (itemIndex === -1) {
+      return res.status(404).json({ error: 'Menu item not found' });
+    }
+    
+    demoData.menuItems.splice(itemIndex, 1);
+    res.json({ message: 'Menu item deleted successfully' });
+  } catch (error) {
+    console.error('Delete menu item error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Order endpoints
 app.get('/api/orders', authenticate, (req, res) => {
   res.json(demoData.orders);
+});
+
+app.put('/api/orders/:id/status', authenticate, (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    
+    if (!status) {
+      return res.status(400).json({ error: 'Status is required' });
+    }
+    
+    const orderIndex = demoData.orders.findIndex(order => order.id === parseInt(id));
+    
+    if (orderIndex === -1) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    
+    demoData.orders[orderIndex].status = status;
+    demoData.orders[orderIndex].updatedAt = new Date().toISOString();
+    
+    res.json(demoData.orders[orderIndex]);
+  } catch (error) {
+    console.error('Update order status error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/api/orders/:id/cancel', authenticate, (req, res) => {
+  try {
+    const { id } = req.params;
+    const orderIndex = demoData.orders.findIndex(order => order.id === parseInt(id));
+    
+    if (orderIndex === -1) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    
+    demoData.orders[orderIndex].status = 'cancelled';
+    demoData.orders[orderIndex].updatedAt = new Date().toISOString();
+    
+    res.json(demoData.orders[orderIndex]);
+  } catch (error) {
+    console.error('Cancel order error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 app.get('/api/dashboard/stats', authenticate, (req, res) => {
