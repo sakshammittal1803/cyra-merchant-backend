@@ -23,10 +23,13 @@ app.use(cors({
     if (!origin || allowedOrigins.some(o => origin.startsWith(o))) {
       callback(null, true);
     } else {
+      console.log('CORS blocked origin:', origin);
       callback(new Error('CORS not allowed'));
     }
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 app.use(express.json({ limit: '10mb' }));
@@ -83,8 +86,12 @@ app.get('/', (req, res) => {
   });
 });
 
+// Handle OPTIONS requests for CORS preflight
+app.options('*', cors());
+
 // Signup endpoint
 app.post('/api/auth/signup', async (req, res) => {
+  console.log('Signup request received:', { body: req.body, headers: req.headers });
   try {
     const { name, email, password, role, restaurantName } = req.body;
     
